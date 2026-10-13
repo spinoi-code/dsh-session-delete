@@ -18,7 +18,8 @@
  *      官方实现要求会话「live 或仍在持久化清单中」，归档后宿主会向客户端
  *      广播 host/archived-sessions-changed，侧栏即时隐藏；
  *   3. sessionPersistence.locate(header) 定位真实磁盘目录（不硬编码路径）；
- *   4. rename 移入 <DSH_HOME>/trash/sessions/<时间戳>-<id>/data/（回收站）；
+ *   4. rename 移入 <DSH_HOME>/trash/sessions/<时间戳>-<转义id>/data/（回收站；
+ *      id 经 encodeEntrySegment 转义成文件系统安全片段，见 ID_RE 注释 / issue #3）；
  *   5. 归档 id 保留（keptHidden），运行期间永不摘除：
  *      客户端侧栏的行来自内存 list store——只有 host/session-removed 帧
  *      （仅 live 会话 dispose 时宿主才发）或全新的 session.list 基线才能把
@@ -60,18 +61,32 @@ const PREFIX = '/api/session-delete'
 const PLUGIN_HEADER = 'x-dsh-plugin'
 /**
  * 会话 id 白名单（宽进严出：仍要求存在于磁盘清单，见 inventory()）。
- * 接受 DSH 核心实际生成的三种会话 id 形态：
- *   - session-<uuid>              主会话（dsh-headless / dsh-session 生成）
- *   - <uuid>                      可延续子代理（dsh-subagent startContinuable 生成裸 UUID）
- *   - <id>-session-<uuid>         配置子代理（dsh-agent-loop 生成）
- * 长度上限 80 与回收站条目名白名单 ENTRY_RE（{1,120}）保持兼容：
- * 条目名 = <UTC 紧凑时间戳 15 字符> + '-' + id，15 + 1 + 80 = 96 ≤ 120，
- * 因此任何被本插件删除的会话其回收站条目必然能 restore / purge（不会自造不可还原条目）。
- * 字符集 [A-Za-z0-9-] 拒绝 `/`、`\`、`.`、`..`、引号等路径穿越载荷。
+ *
+ * DSH 核心契约：SessionId 是 unvalidated branded string——dsh-session-persistence-jsonl
+ * 明言「it MUST be encoded before use in a path」，即 id 的字符集没有任何保证，
+ * 落盘转义是使用方（本插件）的义务，而不是对 id 的格式要求。因此本白名单只承担
+ * 防注入职责（拒绝 `/`、`\`、空白、控制字符等），不假设 id 是文件系统安全的；
+ * id 落盘（回收站条目名）前一律经 encodeEntrySegment 转义（issue #3）。
+ *
+ * 已知四类 id 形态：
+ *   - session-<uuid>                       主会话（dsh-headless / dsh-session 生成）
+ *   - <uuid>                               可延续子代理（dsh-subagent startContinuable）
+ *   - <id>-session-<uuid>                  配置子代理（dsh-agent-loop 生成）
+ *   - im:<渠道>:dm:<seq>:<uid>@<host>      IM 渠道（dsh-im-connect 生成，含
+ *                                          `:`/`@`/`_`/`.`；`:` 是 Windows 保留字符，
+ *                                          直接拼目录名会 ENOENT——绝不能进条目名）
  */
-const ID_RE = /^[A-Za-z0-9-]{8,80}$/
-/** 回收站条目名白名单（时间戳-id，无路径分隔符）。 */
-const ENTRY_RE = /^[A-Za-z0-9._-]{1,120}$/
+const ID_RE = /^[A-Za-z0-9._:@~-]{8,200}$/
+/**
+ * 回收站条目名白名单（<UTC 紧凑时间戳>-<encodeEntrySegment(id)>，无路径分隔符）。
+ * 字符集必须严格等于 encodeEntrySegment 的输出字符集：含 `~`（转义前缀），
+ * 绝不能含 `:` / `@`——条目名会真实落成目录名，而 `:` 在 Windows 上非法
+ * （issue #3 第二层）。只加一半会出现「删得掉、但还原/彻底删除失败」的新坑。
+ * 上限 240 保证最坏情况（15 位时间戳 + '-' + 转义膨胀）仍在 Linux/Windows
+ * 单文件名 255 上限内；deleteSession 在动手前硬校验条目名落在本正则内，
+ * 维持不变式：凡删除成功创建的条目必然能 restore / purge（不自造死条目）。
+ */
+const ENTRY_RE = /^[A-Za-z0-9._~-]{1,240}$/
 /** 回收站根内的保留文件名（审计日志），不可作为条目操作。 */
 const AUDIT_LOG = 'audit.log'
 
@@ -117,6 +132,32 @@ async function dirMtime(path) {
 /** 回收站条目名：<UTC 紧凑时间戳>-<会话 id>。 */
 function entryStamp() {
   return new Date().toISOString().replace(/[-:]/g, '').replace(/\..+$/, '').replace('T', '-')
+}
+
+/** encodeEntrySegment 的原样保留字符集（与核心 encodeSegment 一致，不含 `~`）。 */
+const SAFE_SEG_CH = /^[A-Za-z0-9._-]$/
+/**
+ * 会话 id → 可安全用作单个目录名的片段（`~XXXX` 转义）。
+ *
+ * 与 DSH 核心 dsh-session-persistence-jsonl 的 encodeSegment 保持同一策略与
+ * 同一输出（逐字符对齐，含 `.`/`..` 整体转义与 `~` 自身转义）：SessionId 是
+ * unvalidated branded string，落盘前必须转义（issue #3）。安全字符原样保留，
+ * 其余字符（`:`、`@`、`/`、`\`、空白、`~`……）转为 `~` + 大写十六进制 4 位。
+ * 仅用于条目命名：restore / purge 的会话 id 一律取自条目内 meta.json，
+ * 绝不从条目名反解（转义单射但双向兼容由 meta.json 保证，勿改成反解）。
+ */
+function encodeEntrySegment(raw) {
+  if (raw.length === 0) throw new Error('cannot encode an empty path segment')
+  if (raw === '.') return '~002E'
+  if (raw === '..') return '~002E~002E'
+  let out = ''
+  for (let i = 0; i < raw.length; i++) {
+    const code = raw.charCodeAt(i)
+    const ch = String.fromCharCode(code)
+    if (ch !== '~' && SAFE_SEG_CH.test(ch)) out += ch
+    else out += '~' + code.toString(16).toUpperCase().padStart(4, '0')
+  }
+  return out
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +585,12 @@ export function apply(ctx) {
 
   async function deleteSession(id) {
     if (typeof id !== 'string' || !ID_RE.test(id)) throw httpError(400, 'INVALID_ID', '会话 id 非法')
+    // 条目名在动手之前算好并校验：id 经转义后若仍越界（极端长 id 转义膨胀），
+    // 直接拒绝删除——绝不制造「已归档但没删成」的中间态或不可还原的回收站条目。
+    const entry = `${entryStamp()}-${encodeEntrySegment(id)}`
+    if (!ENTRY_RE.test(entry)) {
+      throw httpError(400, 'INVALID_ID', '会话 id 转义后条目名过长，无法安全移入回收站')
+    }
     const { byId } = await inventory()
     const header = byId.get(id)
     if (header === undefined) throw httpError(404, 'NOT_FOUND', `会话 ${id} 不存在于磁盘记录（可能已删除）`)
@@ -582,7 +629,6 @@ export function apply(ctx) {
     }
 
     const root = await trashRoot()
-    const entry = `${entryStamp()}-${id}`
     const entryDir = join(root, entry)
     const dataDir = join(entryDir, 'data')
     await mkdir(entryDir, { recursive: true })
@@ -638,6 +684,8 @@ export function apply(ctx) {
       }
       items.push({
         entry: entry.name,
+        // 真实 id 以 meta.json 为准（原始未转义）；meta 缺失/损坏时的兜底展示
+        // 保留条目名里转义后的片段（~XXXX 原样），仅影响显示不影响寻址。
         id: typeof meta?.id === 'string' ? meta.id : entry.name.replace(/^\d+-/, ''),
         title: typeof meta?.title === 'string' && meta.title ? meta.title : null,
         cwd: typeof meta?.cwd === 'string' ? meta.cwd : null,
@@ -683,7 +731,9 @@ export function apply(ctx) {
     } catch {
       throw httpError(500, 'NO_META', '回收站条目缺少 meta.json，无法还原')
     }
-    // meta.json 是磁盘文件，可能被篡改；id 过白名单后再交给 locate（纵深防御）
+    // meta.json 是磁盘文件，可能被篡改；id 过白名单后再交给 locate（纵深防御）。
+    // 会话 id 一律取自 meta.json，绝不从条目名反解——条目名是 encodeEntrySegment
+    // 的转义产物（`~XXXX`），仅作寻址（issue #3 修复约定，勿改成反解条目名）。
     if (typeof meta?.id !== 'string' || !ID_RE.test(meta.id)) {
       throw httpError(500, 'BAD_META', '回收站条目 meta.json 中的会话 id 非法')
     }

@@ -615,20 +615,96 @@ const P = '/api/session-delete'
       }
     })
 
-    await test('id 白名单边界：过短 / 含非法字符 / 超长（80）均拒绝', async () => {
-      const evil = ['abc', '1234567', 'under_score-12345678', 'has space', 'a'.repeat(81), 'session-' + 'a'.repeat(80)]
+    await test('id 白名单边界：过短 / 含非法字符 / 超长（200）均拒绝', async () => {
+      const evil = [
+        'abc',
+        '1234567',
+        'has space',
+        '../../etc',
+        '..\\..\\windows\\system32',
+        'foo/bar',
+        'a'.repeat(201),
+        'session-' + 'a'.repeat(193),
+      ]
       for (const id of evil) {
         const r = res()
         await routes.get(`${P}/preview`)(get(`${P}/preview?id=${encodeURIComponent(id)}`), r)
         assert.equal(r.status, 400, `id ${JSON.stringify(id.slice(0, 30))} 应 400，实际 ${r.status}`)
       }
-      // 恰好 80 字符的合法 id 应通过（长度上限边界）
-      const ok80 = 'a'.repeat(80)
-      await createSession(ok80, cwdA, 32)
+      // 恰好 200 字符的合法 id 应通过（长度上限边界）
+      const ok200 = 'a'.repeat(200)
+      await createSession(ok200, cwdA, 32)
       const rOk = res()
-      await routes.get(`${P}/preview`)(get(`${P}/preview?id=${ok80}`), rOk)
-      assert.equal(rOk.status, 200, `80 字符 id 应 200，实际 ${rOk.status}`)
-      headers.splice(headers.findIndex((x) => x.id === ok80), 1)
+      await routes.get(`${P}/preview`)(get(`${P}/preview?id=${ok200}`), rOk)
+      assert.equal(rOk.status, 200, `200 字符 id 应 200，实际 ${rOk.status}`)
+      headers.splice(headers.findIndex((x) => x.id === ok200), 1)
+    })
+
+    await test('IM 渠道 id（im:...@host，issue #3）全链路：preview → delete → trash → restore → purge', async () => {
+      // issue #3 的原始 id：含 `:`（Windows 保留字符）、`@`、`_`、`.`
+      const imId = 'im:weixin_c1d8b206ed8e:dm:1791437656513:o9cq80wUqilWAr4FrFP3Hy9M-JkU@im.wechat'
+      await createSession(imId, cwdA, 96)
+
+      // 第一层修复：ID_RE 放宽后不再 400（宽进仍严出：id 必须真实在清单里）
+      const rPrev = res()
+      await routes.get(`${P}/preview`)(get(`${P}/preview?id=${encodeURIComponent(imId)}`), rPrev)
+      assert.equal(rPrev.status, 200, `preview IM id 应 200，实际 ${rPrev.status} ${JSON.stringify(rPrev.body)}`)
+      assert.equal(rPrev.body.session.id, imId)
+
+      // 第二层修复：删除成功，且条目名是转义片段（无 `:`/`@`，Windows 可落盘）
+      const rDel = res()
+      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id: imId }), rDel)
+      assert.equal(rDel.status, 200, `delete IM id 应 200，实际 ${rDel.status} ${JSON.stringify(rDel.body)}`)
+      const entry = rDel.body.entry
+      assert.ok(entry, 'delete 应返回回收站条目名')
+      assert.ok(!entry.includes(':') && !entry.includes('@'), `条目名不得含保留字符: ${entry}`)
+      // 与核心 encodeSegment 逐字对齐：`:` → ~003A、`@` → ~0040
+      assert.equal(
+        entry.slice(entry.indexOf('-im') + 1),
+        'im~003Aweixin_c1d8b206ed8e~003Adm~003A1791437656513~003Ao9cq80wUqilWAr4FrFP3Hy9M-JkU~0040im.wechat',
+        '条目名应为核心同款转义形态',
+      )
+      headers.splice(headers.findIndex((x) => x.id === imId), 1)
+
+      // meta.json 保存原始未转义 id（还原/清空的唯一 id 来源）
+      const meta = JSON.parse(await readFile(join(home, 'trash', 'sessions', entry, 'meta.json'), 'utf8'))
+      assert.equal(meta.id, imId, 'meta.json 必须保存原始 id')
+
+      // 回收站清单显示原始 id（不是转义片段）
+      const rTrash = res()
+      await routes.get(`${P}/trash`)(get(`${P}/trash`), rTrash)
+      const item = rTrash.body.items.find((i) => i.entry === entry)
+      assert.ok(item, 'trash 应包含该条目')
+      assert.equal(item.id, imId, 'trash 清单的 id 应为原始 id')
+
+      // 还原成功且 id 往返一致（客户端按 entry 寻址，id 取自 meta.json）
+      const rRes = res()
+      await routes.get(`${P}/restore`)(bodyReq('POST', `${P}/restore`, { entry }), rRes)
+      assert.equal(rRes.status, 200, `restore 应 200，实际 ${rRes.status} ${JSON.stringify(rRes.body)}`)
+      assert.equal(rRes.body.id, imId, 'restore 返回的 id 应为原始 id')
+      headers.push({ type: 'session', version: 1, id: imId, createdAt: Date.now(), delegationDepth: 0, cwd: cwdA })
+
+      // 再删一次走 purge 彻底删除（同样按 entry 寻址）
+      const rDel2 = res()
+      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id: imId }), rDel2)
+      assert.equal(rDel2.status, 200)
+      headers.splice(headers.findIndex((x) => x.id === imId), 1)
+      const rPurge = res()
+      await routes.get(`${P}/purge`)(bodyReq('POST', `${P}/purge`, { entry: rDel2.body.entry }), rPurge)
+      assert.equal(rPurge.status, 200, `purge 应 200，实际 ${rPurge.status} ${JSON.stringify(rPurge.body)}`)
+    })
+
+    await test('极端长 id 转义膨胀越界 → 拒绝删除而非制造不可还原条目', async () => {
+      // 150 字符合法 id，其中 50 个 `:` 各膨胀 4 倍 → 条目名 16+100+200=316 > 240
+      const longId = 'a:'.repeat(50) + 'a'.repeat(50)
+      await createSession(longId, cwdA, 32)
+      const r = res()
+      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id: longId }), r)
+      assert.equal(r.status, 400, `转义越界的 id 应 400，实际 ${r.status}`)
+      // 目录仍在原地（未归档未移动——校验发生在动手之前）
+      const st = await stat(join(sessionsRoot, slug(cwdA), longId))
+      assert.ok(st.isDirectory(), '会话目录应原样保留')
+      headers.splice(headers.findIndex((x) => x.id === longId), 1)
     })
 
     await test('回收站条目路径穿越防护：entry=".." / "." / "audit.log" 全部拒绝', async () => {

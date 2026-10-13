@@ -38,6 +38,8 @@ dsh plugin --profile web add ./dsh-session-delete-0.5.0.tgz
 
 **旧版 DSH 回退**：在线解除归档走 workspaceRegistry 内部状态机，插件启动时自动探测能力；不可用时隐藏还原入口，可在 DSH 停止时运行 `node tools/unhide.mjs <sessionId>` 离线找回。旧版同样无法在重启时清理归档 ghost（能力缺失时 reconcile 静默跳过）。
 
+**任意渠道 id（IM 等）**：DSH 核心约定 SessionId 是 unvalidated 字符串（核心落盘前也一律转义），插件同理——id 白名单只做防注入（`/ \ 空白` 等仍拒绝），不假设字符集。含 `:`/`@` 的 IM 渠道 id（如 `im:weixin_...@im.wechat`）可正常删除/还原；回收站条目名用与核心 `encodeSegment` 相同的 `~XXXX` 转义（Windows 保留字符安全），还原/清空的会话 id 始终取自条目内 `meta.json`，绝不反解条目名。
+
 **兼容性**：同时支持新版（0.1.5+，`sessionPersistence.list()` 返回 `{header, revision, sizeBytes}` 快照）与旧版（≤0.1.1-rc.x，直接返回 header 数组）两代持久化接口——v0.4.0 在 DSH 0.1.5 上 `/list`、`/trash` 全部 500（"reading 'length'"）的问题已在 v0.4.1 修复。
 
 ## 开发
